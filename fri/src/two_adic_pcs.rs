@@ -702,6 +702,36 @@ where
 
         Ok(())
     }
+
+    fn verify_run_to_completion(
+        &self,
+        commitments_with_opening_points: Vec<
+            CommitmentWithOpeningPoints<Challenge, Self::Commitment, Self::Domain>,
+        >,
+        proof: &Self::Proof,
+        challenger: &mut Challenger,
+    ) -> Result<(), Self::Error> {
+        // Same transcript ordering as `verify`. Observation cost is constant
+        // per element, so this loop is CT.
+        for (_, round) in &commitments_with_opening_points {
+            for (_, mat) in round {
+                for (_, point) in mat {
+                    challenger.observe_algebra_slice(point);
+                }
+            }
+        }
+
+        let folding: TwoAdicFriFoldingForMmcs<Val, InputMmcs> = TwoAdicFriFolding(PhantomData);
+
+        verifier::verify_fri_run_to_completion(
+            &folding,
+            &self.fri,
+            proof,
+            challenger,
+            &commitments_with_opening_points,
+            &self.mmcs,
+        )
+    }
 }
 
 impl<Val, Dft, InputMmcs, FriMmcs> BuildPeriodicLdeTableFast

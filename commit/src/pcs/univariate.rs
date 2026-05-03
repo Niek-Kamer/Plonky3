@@ -282,6 +282,31 @@ where
         fiat_shamir_challenger: &mut Challenger,
     ) -> Result<(), Self::Error>;
 
+    /// Constant-time variant of [`Pcs::verify`]: continues past data-path
+    /// failures (Merkle mismatches, PoW witness failures, etc.) so total
+    /// cycle count is independent of where in the proof a failure occurs.
+    /// The accept/reject decision is preserved.
+    ///
+    /// Default delegates to [`Pcs::verify`] (non-CT). PCS implementations
+    /// targeting hardware tokens or other side-channel-sensitive contexts
+    /// should override.
+    #[allow(clippy::type_complexity)]
+    fn verify_run_to_completion(
+        &self,
+        commitments_with_opening_points: Vec<(
+            Self::Commitment,
+            Vec<(Self::Domain, Vec<(Challenge, Vec<Challenge>)>)>,
+        )>,
+        proof: &Self::Proof,
+        fiat_shamir_challenger: &mut Challenger,
+    ) -> Result<(), Self::Error> {
+        self.verify(
+            commitments_with_opening_points,
+            proof,
+            fiat_shamir_challenger,
+        )
+    }
+
     fn get_opt_randomization_poly_commitment(
         &self,
         _domain: impl IntoIterator<Item = Self::Domain>,

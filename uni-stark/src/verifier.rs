@@ -493,3 +493,292 @@ where
 
     Ok(())
 }
+
+// ============================================================================
+// Run-to-completion (constant-time) verifier variant.
+//
+// `verify` / `verify_with_preprocessed` short-circuit on the first internal
+// failure. For mutations that fail deep inside the PCS verify (e.g. a
+// public-input flip that desyncs the challenger and triggers a Merkle
+// mismatch in commit-phase round 0 of FRI), the verifier completes orders
+// of magnitude faster than the honest path. That timing differential is
+// observable to remote attackers.
+//
+// `verify_run_to_completion` is structurally identical except it dispatches
+// to `Pcs::verify_run_to_completion` (which itself runs all FRI checks to
+// completion) and the final `verify_constraints` failure is captured rather
+// than propagated. Whether checks pass or fail, the same arithmetic and
+// challenger work runs to completion.
+//
+// **Scoping note**: shape errors (length / dimension / range checks) keep
+// their early-returns. They are data-independent — a mutated proof byte
+// cannot change a vector's length — and continuing past them would cause
+// iterator panics. Inputs reaching this layer should already have been
+// shape-validated at parse.
+// ============================================================================
+
+/// Constant-time variant of [`verify`]: continues past data-path failures
+/// instead of returning early, so total cycle count matches the honest path.
+///
+/// See module-level RTC notes for scope.
+#[instrument(skip_all)]
+pub fn verify_run_to_completion<SC, A>(
+    config: &SC,
+    air: &A,
+    proof: &Proof<SC>,
+    public_values: &[Val<SC>],
+) -> Result<(), VerificationError<PcsError<SC>>>
+where
+    SC: StarkGenericConfig,
+    A: Air<SymbolicAirBuilder<Val<SC>>> + for<'a> Air<VerifierConstraintFolder<'a, SC>>,
+{
+    verify_with_preprocessed_run_to_completion(config, air, proof, public_values, None)
+}
+
+/// Constant-time variant of [`verify_with_preprocessed`]. See module-level
+/// RTC notes for scope.
+#[instrument(skip_all)]
+pub fn verify_with_preprocessed_run_to_completion<SC, A>(
+    config: &SC,
+    air: &A,
+    proof: &Proof<SC>,
+    public_values: &[Val<SC>],
+    preprocessed_vk: Option<&PreprocessedVerifierKey<SC>>,
+) -> Result<(), VerificationError<PcsError<SC>>>
+where
+    SC: StarkGenericConfig,
+    A: Air<SymbolicAirBuilder<Val<SC>>> + for<'a> Air<VerifierConstraintFolder<'a, SC>>,
+{
+    let Proof {
+        commitments,
+        opened_values,
+        opening_proof,
+        degree_bits,
+    } = proof;
+    let degree_bits = *degree_bits;
+
+    let pcs = config.pcs();
+    let (base_degree_bits, degree) = validate_degree_bits(None, degree_bits, config.is_zk())?;
+    let trace_domain = pcs.natural_domain_for_degree(degree);
+    let (preprocessed_width, preprocessed_commit) =
+        process_preprocessed_trace::<SC, A>(air, opened_values, preprocessed_vk)?;
+
+    if let Some(vk) = preprocessed_vk
+        && preprocessed_width > 0
+        && vk.degree_bits != degree_bits
+    {
+        return Err(InvalidProofShapeError::PreprocessedDegreeMismatch {
+            vk_degree_bits: vk.degree_bits,
+            proof_degree_bits: degree_bits,
+        }
+        .into());
+    }
+
+    let layout = AirLayout {
+        preprocessed_width,
+        main_width: air.width(),
+        num_public_values: air.num_public_values(),
+        num_periodic_columns: air.num_periodic_columns(),
+        ..Default::default()
+    };
+    let log_num_quotient_chunks =
+        get_log_num_quotient_chunks::<Val<SC>, A>(air, layout, config.is_zk());
+    let (_, num_quotient_chunks) = checked_log_size_sum(log_num_quotient_chunks, config.is_zk())
+        .ok_or_else(|| InvalidProofShapeError::QuotientDomainTooLarge {
+            air: None,
+            maximum: usize::BITS as usize - 1,
+            got: log_num_quotient_chunks.saturating_add(config.is_zk()),
+        })?;
+    let mut challenger = config.initialise_challenger();
+    let init_trace_domain = pcs.natural_domain_for_degree(degree >> config.is_zk());
+
+    let (_, quotient_domain_size) = checked_log_size_sum(degree_bits, log_num_quotient_chunks)
+        .ok_or_else(|| InvalidProofShapeError::QuotientDomainTooLarge {
+            air: None,
+            maximum: usize::BITS as usize - 1,
+            got: degree_bits.saturating_add(log_num_quotient_chunks),
+        })?;
+    let quotient_domain = trace_domain.create_disjoint_domain(quotient_domain_size);
+    let quotient_chunks_domains = quotient_domain.split_domains(num_quotient_chunks);
+
+    let randomized_quotient_chunks_domains = quotient_chunks_domains
+        .iter()
+        .map(|domain| pcs.natural_domain_for_degree(domain.size() << (config.is_zk())))
+        .collect_vec();
+    if (opened_values.random.is_some() != SC::Pcs::ZK)
+        || (commitments.random.is_some() != SC::Pcs::ZK)
+    {
+        return Err(VerificationError::RandomizationError);
+    }
+
+    let air_width = A::width(air);
+    let expected_public_values_len = air.num_public_values();
+    if public_values.len() != expected_public_values_len {
+        return Err(InvalidProofShapeError::PublicValuesLengthMismatch {
+            expected: expected_public_values_len,
+            got: public_values.len(),
+        }
+        .into());
+    }
+
+    let main_next = !air.main_next_row_columns().is_empty();
+    let pre_next = !air.preprocessed_next_row_columns().is_empty();
+    let trace_next_ok = if main_next {
+        opened_values
+            .trace_next
+            .as_ref()
+            .is_some_and(|v| v.len() == air_width)
+    } else {
+        opened_values.trace_next.is_none()
+    };
+    let valid_shape = opened_values.trace_local.len() == air_width
+        && trace_next_ok
+        && opened_values.quotient_chunks.len() == num_quotient_chunks
+        && opened_values
+            .quotient_chunks
+            .iter()
+            .all(|qc| qc.len() == SC::Challenge::DIMENSION)
+        && opened_values
+            .random
+            .as_ref()
+            .is_none_or(|r_comm| r_comm.len() == SC::Challenge::DIMENSION);
+    if !valid_shape {
+        return Err(InvalidProofShapeError::OpenedValuesDimensionMismatch.into());
+    }
+
+    challenger.observe(Val::<SC>::from_usize(degree_bits));
+    challenger.observe(Val::<SC>::from_usize(base_degree_bits));
+    challenger.observe(Val::<SC>::from_usize(preprocessed_width));
+    challenger.observe(commitments.trace.clone());
+    if preprocessed_width > 0 {
+        challenger.observe(preprocessed_commit.as_ref().unwrap().clone());
+    }
+    challenger.observe_slice(public_values);
+
+    let alpha = challenger.sample_algebra_element();
+    challenger.observe(commitments.quotient_chunks.clone());
+
+    if let Some(r_commit) = commitments.random.clone() {
+        challenger.observe(r_commit);
+    }
+
+    let zeta = challenger.sample_algebra_element();
+    let periodic_values: Vec<SC::Challenge> = air
+        .periodic_columns()
+        .iter()
+        .map(|periodic_col| init_trace_domain.evaluate_periodic_column_at(periodic_col, zeta))
+        .collect();
+
+    let zeta_next = init_trace_domain
+        .next_point(zeta)
+        .ok_or(VerificationError::NextPointUnavailable)?;
+
+    let mut coms_to_verify = if let Some(random_commit) = &commitments.random {
+        let random_values = opened_values
+            .random
+            .as_ref()
+            .ok_or(VerificationError::RandomizationError)?;
+        vec![(
+            random_commit.clone(),
+            vec![(trace_domain, vec![(zeta, random_values.clone())])],
+        )]
+    } else {
+        vec![]
+    };
+    let trace_round = {
+        let mut trace_points = vec![(zeta, opened_values.trace_local.clone())];
+        if main_next {
+            trace_points.push((
+                zeta_next,
+                opened_values
+                    .trace_next
+                    .clone()
+                    .expect("checked in shape validation"),
+            ));
+        }
+        (
+            commitments.trace.clone(),
+            vec![(trace_domain, trace_points)],
+        )
+    };
+    coms_to_verify.extend(vec![
+        trace_round,
+        (
+            commitments.quotient_chunks.clone(),
+            zip_eq(
+                randomized_quotient_chunks_domains.iter(),
+                &opened_values.quotient_chunks,
+                VerificationError::from(InvalidProofShapeError::QuotientDomainsCountMismatch {
+                    air: 0,
+                }),
+            )?
+            .map(|(domain, values)| (*domain, vec![(zeta, values.clone())]))
+            .collect_vec(),
+        ),
+    ]);
+
+    if preprocessed_width > 0 {
+        let mut pre_points = vec![(zeta, opened_values.preprocessed_local.clone().unwrap())];
+        if pre_next {
+            pre_points.push((zeta_next, opened_values.preprocessed_next.clone().unwrap()));
+        }
+        coms_to_verify.push((
+            preprocessed_commit.unwrap(),
+            vec![(trace_domain, pre_points)],
+        ));
+    }
+
+    // CT-critical: dispatch to PCS run-to-completion variant. For
+    // TwoAdicFriPcs this runs every FRI check (Merkle, PoW, FinalPoly) to
+    // completion and ANDs the results.
+    let pcs_result = pcs
+        .verify_run_to_completion(coms_to_verify, opening_proof, &mut challenger)
+        .map_err(VerificationError::InvalidOpeningArgument);
+
+    let quotient = recompose_quotient_from_chunks::<SC>(
+        &quotient_chunks_domains,
+        &opened_values.quotient_chunks,
+        zeta,
+    );
+
+    let zeros;
+    let trace_next_slice = match &opened_values.trace_next {
+        Some(v) => v.as_slice(),
+        None => {
+            zeros = vec![SC::Challenge::ZERO; air_width];
+            &zeros
+        }
+    };
+    let pre_next_zeros;
+    let preprocessed_next_for_verify = match &opened_values.preprocessed_next {
+        Some(v) => Some(v.as_slice()),
+        None if preprocessed_width > 0 => {
+            pre_next_zeros = vec![SC::Challenge::ZERO; preprocessed_width];
+            Some(pre_next_zeros.as_slice())
+        }
+        None => None,
+    };
+    // CT-critical: capture the constraint-check result rather than `?`-ing
+    // it. `verify_constraints` does the same arithmetic regardless of pass
+    // or fail, so cycle count is preserved.
+    let constraints_result = verify_constraints::<SC, A, PcsError<SC>>(
+        air,
+        &opened_values.trace_local,
+        trace_next_slice,
+        opened_values.preprocessed_local.as_deref(),
+        preprocessed_next_for_verify,
+        &periodic_values,
+        public_values,
+        init_trace_domain,
+        zeta,
+        alpha,
+        quotient,
+    );
+
+    // First failure wins for diagnostics; both must hold for accept.
+    match (pcs_result, constraints_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(e), _) => Err(e),
+        (Ok(()), Err(e)) => Err(e),
+    }
+}

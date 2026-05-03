@@ -632,6 +632,494 @@ where
         .collect())
 }
 
+// ============================================================================
+// Run-to-completion (constant-time) verifier variant.
+//
+// `verify_fri` short-circuits on the first internal failure, so a mutation
+// that fails early (e.g. a corrupted Merkle path in commit-phase round 0)
+// completes in a tiny fraction of the cycles needed by an honest accept.
+// That timing differential is observable to remote attackers.
+//
+// `verify_fri_run_to_completion` is structurally identical except every
+// data-path failure (PoW witness, MMCS verify, FinalPoly, etc.) is
+// accumulated into a single `Option<FriError>` and returned at the very end.
+// Whether a check passes or fails, the same arithmetic and challenger-state
+// work runs to completion.
+//
+// **Scoping note**: shape-mismatch errors (counts/lengths) keep their
+// early-returns. They are data-independent — a mutated proof byte cannot
+// change a `Vec::len()` — and we cannot meaningfully continue past them
+// without causing iterator panics. Inputs reaching this layer should already
+// have been shape-validated at parse.
+// ============================================================================
+
+/// Constant-time variant of [`verify_fri`]: continues past data-path failures
+/// instead of returning early, so total cycle count matches the honest path.
+///
+/// See module-level RTC notes for scope.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_fri_run_to_completion<Folding, Val, Challenge, InputMmcs, FriMmcs, Challenger>(
+    folding: &Folding,
+    params: &FriParameters<FriMmcs>,
+    proof: &FriProof<Challenge, FriMmcs, Challenger::Witness, Folding::InputProof>,
+    challenger: &mut Challenger,
+    commitments_with_opening_points: &[CommitmentWithOpeningPoints<
+        Challenge,
+        InputMmcs::Commitment,
+        TwoAdicMultiplicativeCoset<Val>,
+    >],
+    input_mmcs: &InputMmcs,
+) -> Result<(), FriError<FriMmcs::Error, InputMmcs::Error>>
+where
+    Val: TwoAdicField,
+    Challenge: ExtensionField<Val>,
+    InputMmcs: Mmcs<Val>,
+    FriMmcs: Mmcs<Challenge>,
+    Challenger: FieldChallenger<Val> + GrindingChallenger + CanObserve<FriMmcs::Commitment>,
+    Folding: FriFoldingStrategy<
+            Val,
+            Challenge,
+            InputError = InputMmcs::Error,
+            InputProof = Vec<BatchOpening<Val, InputMmcs>>,
+        >,
+{
+    // First-data-path-failure remembered for diagnostic purposes; subsequent
+    // failures are merged in via `merge_failure`. The overall accept/reject
+    // decision is `data_failure.is_none()`.
+    let mut data_failure: Option<FriError<FriMmcs::Error, InputMmcs::Error>> = None;
+    let merge_failure = |slot: &mut Option<FriError<FriMmcs::Error, InputMmcs::Error>>,
+                         e: FriError<FriMmcs::Error, InputMmcs::Error>| {
+        if slot.is_none() {
+            *slot = Some(e);
+        }
+    };
+
+    let alpha: Challenge = challenger.sample_algebra_element();
+
+    // --- Shape checks (kept as early-returns; see RTC scoping note above). ---
+    let expected_rounds = proof.commit_phase_commits.len();
+    for (query, qp) in proof.query_proofs.iter().enumerate() {
+        let got_rounds = qp.commit_phase_openings.len();
+        if got_rounds != expected_rounds {
+            return Err(FriError::QueryCommitPhaseOpeningsCountMismatch {
+                query,
+                expected: expected_rounds,
+                got: got_rounds,
+            });
+        }
+    }
+    let log_arities: Vec<usize> = proof
+        .query_proofs
+        .first()
+        .map(|qp| {
+            qp.commit_phase_openings
+                .iter()
+                .map(|o| o.log_arity as usize)
+                .collect()
+        })
+        .unwrap_or_default();
+    for (query, qp) in proof.query_proofs.iter().enumerate().skip(1) {
+        let got_log_arities = qp
+            .commit_phase_openings
+            .iter()
+            .map(|o| o.log_arity as usize)
+            .collect::<Vec<_>>();
+        if got_log_arities != log_arities {
+            return Err(FriError::QueryLogAritiesMismatch {
+                query,
+                expected: log_arities,
+                got: got_log_arities,
+            });
+        }
+    }
+    let total_log_reduction: usize = log_arities.iter().sum();
+    let log_global_max_height = total_log_reduction + params.log_blowup + params.log_final_poly_len;
+
+    if proof.commit_pow_witnesses.len() != proof.commit_phase_commits.len() {
+        return Err(FriError::CommitPowWitnessCountMismatch {
+            expected: proof.commit_phase_commits.len(),
+            got: proof.commit_pow_witnesses.len(),
+        });
+    }
+
+    // --- Per-round commit observation + PoW + beta sampling.
+    //
+    // CT-critical: `check_witness` advances the challenger regardless of
+    // result. We always sample beta after, so beta values match the honest
+    // transcript even if a witness is invalid. The PoW failure is recorded
+    // and ANDed into the final result.
+    let betas: Vec<Challenge> = proof
+        .commit_phase_commits
+        .iter()
+        .zip(&proof.commit_pow_witnesses)
+        .map(|(comm, witness)| {
+            challenger.observe(comm.clone());
+            if !challenger.check_witness(params.commit_proof_of_work_bits, *witness) {
+                merge_failure(&mut data_failure, FriError::InvalidPowWitness);
+            }
+            challenger.sample_algebra_element()
+        })
+        .collect();
+
+    if proof.final_poly.len() != params.final_poly_len() {
+        return Err(FriError::FinalPolyLengthMismatch {
+            expected: params.final_poly_len(),
+            got: proof.final_poly.len(),
+        });
+    }
+    challenger.observe_algebra_slice(&proof.final_poly);
+
+    if proof.query_proofs.len() != params.num_queries {
+        return Err(FriError::QueryProofCountMismatch {
+            expected: params.num_queries,
+            got: proof.query_proofs.len(),
+        });
+    }
+
+    for &log_arity in &log_arities {
+        challenger.observe(Val::from_usize(log_arity));
+    }
+
+    // CT-critical: query PoW check — record failure, do not return early.
+    if !challenger.check_witness(params.query_proof_of_work_bits, proof.query_pow_witness) {
+        merge_failure(&mut data_failure, FriError::InvalidPowWitness);
+    }
+
+    let log_final_height = params.log_blowup + params.log_final_poly_len;
+
+    for QueryProof {
+        input_proof,
+        commit_phase_openings,
+    } in proof.query_proofs.iter()
+    {
+        let index =
+            challenger.sample_bits(log_global_max_height + folding.extra_query_index_bits());
+
+        // open_input_run_to_completion ANDs Merkle and constant-degree
+        // failures into `ro_data_failure` but always returns valid-shape
+        // reduced openings (using prover-supplied opened values whether or
+        // not the Merkle proofs verified).
+        let (ro, ro_data_failure) = open_input_run_to_completion(
+            params,
+            log_global_max_height,
+            index,
+            input_proof,
+            alpha,
+            input_mmcs,
+            commitments_with_opening_points,
+        )?;
+        if let Some(e) = ro_data_failure {
+            merge_failure(&mut data_failure, e);
+        }
+
+        debug_assert!(
+            ro.iter().tuple_windows().all(|((l, _), (r, _))| l > r),
+            "reduced openings sorted by height descending"
+        );
+
+        let mut domain_index = index >> folding.extra_query_index_bits();
+
+        let fold_data_iter = betas
+            .iter()
+            .zip(proof.commit_phase_commits.iter())
+            .zip(commit_phase_openings.iter());
+
+        let (folded_eval, query_data_failure) = verify_query_run_to_completion(
+            folding,
+            params,
+            &mut domain_index,
+            fold_data_iter,
+            ro,
+            log_global_max_height,
+            log_final_height,
+        )?;
+        if let Some(e) = query_data_failure {
+            merge_failure(&mut data_failure, e);
+        }
+
+        let x = Val::two_adic_generator(log_global_max_height)
+            .exp_u64(reverse_bits_len(domain_index, log_global_max_height) as u64);
+
+        let mut eval = Challenge::ZERO;
+        for &coeff in proof.final_poly.iter().rev() {
+            eval = eval * x + coeff;
+        }
+
+        if eval != folded_eval {
+            merge_failure(&mut data_failure, FriError::FinalPolyMismatch);
+        }
+    }
+
+    match data_failure {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// RTC twin of [`verify_query`]. Shape errors still early-return (they would
+/// produce iterator panics if we tried to continue past them); Merkle-path
+/// failures are recorded and the fold chain continues with the
+/// prover-supplied evaluations regardless. Returns `(folded_eval, first_data_failure)`.
+#[inline]
+#[allow(clippy::type_complexity)]
+fn verify_query_run_to_completion<'a, Folding, F, EF, M>(
+    folding: &Folding,
+    params: &FriParameters<M>,
+    start_index: &mut usize,
+    fold_data_iter: impl ExactSizeIterator<Item = CommitStep<'a, EF, M>>,
+    reduced_openings: FriOpenings<EF>,
+    log_global_max_height: usize,
+    log_final_height: usize,
+) -> Result<
+    (EF, Option<FriError<M::Error, Folding::InputError>>),
+    FriError<M::Error, Folding::InputError>,
+>
+where
+    F: Field,
+    EF: ExtensionField<F>,
+    M: Mmcs<EF> + 'a,
+    Folding: FriFoldingStrategy<F, EF>,
+{
+    let mut data_failure: Option<FriError<M::Error, Folding::InputError>> = None;
+
+    let mut ro_iter = reduced_openings.into_iter().peekable();
+
+    let Some((first_log_height, _)) = ro_iter.peek() else {
+        return Err(FriError::MissingInitialReducedOpening {
+            expected: log_global_max_height,
+        });
+    };
+    if *first_log_height != log_global_max_height {
+        return Err(FriError::InitialReducedOpeningHeightMismatch {
+            expected: log_global_max_height,
+            got: *first_log_height,
+        });
+    }
+    let mut folded_eval = ro_iter.next().unwrap().1;
+
+    let mut log_current_height = log_global_max_height;
+
+    for (round, ((&beta, comm), opening)) in fold_data_iter.enumerate() {
+        let log_arity = opening.log_arity as usize;
+        let arity = 1 << log_arity;
+
+        if opening.sibling_values.len() != arity - 1 {
+            return Err(FriError::SiblingValuesLengthMismatch {
+                round,
+                expected: arity - 1,
+                got: opening.sibling_values.len(),
+            });
+        }
+
+        let index_in_group = *start_index % arity;
+        let mut evals = vec![EF::ZERO; arity];
+        evals[index_in_group] = folded_eval;
+
+        let mut sibling_idx = 0;
+        #[allow(clippy::needless_range_loop)]
+        for j in 0..arity {
+            if j != index_in_group {
+                evals[j] = opening.sibling_values[sibling_idx];
+                sibling_idx += 1;
+            }
+        }
+
+        let log_folded_height = log_current_height - log_arity;
+
+        let dims = &[Dimensions {
+            width: arity,
+            height: 1 << log_folded_height,
+        }];
+
+        *start_index >>= log_arity;
+
+        // CT-critical: do not propagate Merkle failure with `?`. Record it
+        // and continue folding with the prover-supplied evals.
+        let merkle_result = params.mmcs.verify_batch(
+            comm,
+            dims,
+            *start_index,
+            BatchOpeningRef::new(&[evals.clone()], &opening.opening_proof),
+        );
+        if let Err(e) = merkle_result {
+            if data_failure.is_none() {
+                data_failure = Some(FriError::CommitPhaseMmcsError(e));
+            }
+        }
+
+        folded_eval = folding.fold_row(
+            *start_index,
+            log_folded_height,
+            log_arity,
+            beta,
+            evals.into_iter(),
+        );
+
+        log_current_height = log_folded_height;
+
+        if let Some((_, ro)) = ro_iter.next_if(|(lh, _)| *lh == log_folded_height) {
+            let beta_pow = beta.exp_power_of_2(log_arity);
+            folded_eval += beta_pow * ro;
+        }
+    }
+
+    if log_current_height != log_final_height {
+        return Err(FriError::FinalFoldHeightMismatch {
+            expected: log_final_height,
+            got: log_current_height,
+        });
+    }
+
+    if let Some((next_log_height, _)) = ro_iter.next() {
+        return Err(FriError::UnconsumedReducedOpenings {
+            next_log_height,
+            remaining: 1 + ro_iter.count(),
+        });
+    }
+
+    Ok((folded_eval, data_failure))
+}
+
+/// RTC twin of [`open_input`]. Shape errors early-return; Merkle batch
+/// verification failures are recorded and the reduced-opening computation
+/// continues with the prover-supplied opened values. Returns
+/// `(reduced_openings, first_data_failure)`.
+#[inline]
+#[allow(clippy::type_complexity)]
+fn open_input_run_to_completion<Val, Challenge, InputMmcs, FriMmcs>(
+    params: &FriParameters<FriMmcs>,
+    log_global_max_height: usize,
+    index: usize,
+    input_proof: &[BatchOpening<Val, InputMmcs>],
+    alpha: Challenge,
+    input_mmcs: &InputMmcs,
+    commitments_with_opening_points: &[CommitmentWithOpeningPoints<
+        Challenge,
+        InputMmcs::Commitment,
+        TwoAdicMultiplicativeCoset<Val>,
+    >],
+) -> Result<
+    (
+        FriOpenings<Challenge>,
+        Option<FriError<FriMmcs::Error, InputMmcs::Error>>,
+    ),
+    FriError<FriMmcs::Error, InputMmcs::Error>,
+>
+where
+    Val: TwoAdicField,
+    Challenge: ExtensionField<Val>,
+    InputMmcs: Mmcs<Val>,
+    FriMmcs: Mmcs<Challenge>,
+{
+    let mut data_failure: Option<FriError<FriMmcs::Error, InputMmcs::Error>> = None;
+
+    let mut reduced_openings = BTreeMap::<usize, (Challenge, Challenge)>::new();
+
+    if input_proof.len() != commitments_with_opening_points.len() {
+        return Err(FriError::InputProofBatchCountMismatch {
+            expected: commitments_with_opening_points.len(),
+            got: input_proof.len(),
+        });
+    }
+
+    for (batch, (batch_opening, (batch_commit, mats))) in input_proof
+        .iter()
+        .zip(commitments_with_opening_points.iter())
+        .enumerate()
+    {
+        let batch_heights = mats
+            .iter()
+            .map(|(domain, _)| domain.size() << params.log_blowup)
+            .collect_vec();
+        let batch_dims = batch_heights
+            .iter()
+            .map(|&height| Dimensions { width: 0, height })
+            .collect_vec();
+
+        let reduced_index = batch_heights
+            .iter()
+            .max()
+            .map(|&h| index >> (log_global_max_height - log2_strict_usize(h)))
+            .unwrap_or(0);
+
+        if batch_opening.opened_values.len() != mats.len() {
+            return Err(FriError::BatchOpenedValuesCountMismatch {
+                batch,
+                expected: mats.len(),
+                got: batch_opening.opened_values.len(),
+            });
+        }
+
+        // CT-critical: do not propagate Merkle failure with `?`. Record it
+        // and continue with the prover-supplied opened_values.
+        let merkle_result = input_mmcs.verify_batch(
+            batch_commit,
+            &batch_dims,
+            reduced_index,
+            batch_opening.into(),
+        );
+        if let Err(e) = merkle_result {
+            if data_failure.is_none() {
+                data_failure = Some(FriError::InputError(e));
+            }
+        }
+
+        for (matrix, (mat_opening, (mat_domain, mat_points_and_values))) in batch_opening
+            .opened_values
+            .iter()
+            .zip(mats.iter())
+            .enumerate()
+        {
+            let log_height = log2_strict_usize(mat_domain.size()) + params.log_blowup;
+
+            let bits_reduced = log_global_max_height - log_height;
+            let rev_reduced_index = reverse_bits_len(index >> bits_reduced, log_height);
+
+            let x = Val::GENERATOR
+                * Val::two_adic_generator(log_height).exp_u64(rev_reduced_index as u64);
+
+            let (alpha_pow, ro) = reduced_openings
+                .entry(log_height)
+                .or_insert((Challenge::ONE, Challenge::ZERO));
+
+            for (point, (z, ps_at_z)) in mat_points_and_values.iter().enumerate() {
+                let quotient = (*z - x).inverse();
+                if mat_opening.len() != ps_at_z.len() {
+                    return Err(FriError::PointEvaluationCountMismatch {
+                        batch,
+                        matrix,
+                        point,
+                        expected: mat_opening.len(),
+                        got: ps_at_z.len(),
+                    });
+                }
+                for (&p_at_x, &p_at_z) in mat_opening.iter().zip(ps_at_z.iter()) {
+                    *ro += *alpha_pow * (p_at_z - p_at_x) * quotient;
+                    *alpha_pow *= alpha;
+                }
+            }
+        }
+
+        // CT-critical: convert the height==log_blowup constant-degree
+        // check from early-return to accumulator.
+        if let Some((_, ro)) = reduced_openings.get(&params.log_blowup)
+            && !ro.is_zero()
+            && data_failure.is_none()
+        {
+            data_failure = Some(FriError::FinalPolyMismatch);
+        }
+    }
+
+    Ok((
+        reduced_openings
+            .into_iter()
+            .rev()
+            .map(|(log_height, (_, ro))| (log_height, ro))
+            .collect(),
+        data_failure,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use core::marker::PhantomData;
