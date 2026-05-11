@@ -20,6 +20,8 @@ jobs:
           - os: ubuntu-latest
           - os: ubuntu-latest
             features: "+avx2"
+          - os: ubuntu-latest
+            features: "+avx512f"
           - os: macos-latest
           - os: windows-latest
     runs-on: ${{ matrix.os }}

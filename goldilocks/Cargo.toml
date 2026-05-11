@@ -39,5 +39,9 @@ harness = false
 name = "extension"
 harness = false
 
+[[bench]]
+name = "poseidon"
+harness = false
+
 [lints]
 workspace = true

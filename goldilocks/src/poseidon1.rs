@@ -1106,6 +1106,36 @@ mod tests {
             let avx512_output = avx512_input.map(|x| x.0[0]);
             assert_eq!(avx512_output, expected);
         }
+
+        #[test]
+        fn test_avx512_poseidon_width_8() {
+            let perm = default_goldilocks_poseidon1_8();
+            let input: [F; 8] = F::new_array([0, 1, 2, 3, 4, 5, 6, 7]);
+
+            let mut expected = input;
+            perm.permute_mut(&mut expected);
+
+            let mut avx512_input = input.map(Into::<PackedGoldilocksAVX512>::into);
+            perm.permute_mut(&mut avx512_input);
+
+            let avx512_output = avx512_input.map(|x| x.0[0]);
+            assert_eq!(avx512_output, expected);
+        }
+
+        #[test]
+        fn test_avx512_poseidon_width_12() {
+            let perm = default_goldilocks_poseidon1_12();
+            let input: [F; 12] = F::new_array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+
+            let mut expected = input;
+            perm.permute_mut(&mut expected);
+
+            let mut avx512_input = input.map(Into::<PackedGoldilocksAVX512>::into);
+            perm.permute_mut(&mut avx512_input);
+
+            let avx512_output = avx512_input.map(|x| x.0[0]);
+            assert_eq!(avx512_output, expected);
+        }
     }
 
     #[cfg(all(
@@ -1154,6 +1184,36 @@ mod tests {
 
             let mut avx2_input = input.map(Into::<PackedGoldilocksAVX2>::into);
             poseidon.permute_mut(&mut avx2_input);
+
+            let avx2_output = avx2_input.map(|x| x.0[0]);
+            assert_eq!(avx2_output, expected);
+        }
+
+        #[test]
+        fn test_avx2_poseidon_width_8() {
+            let perm = default_goldilocks_poseidon1_8();
+            let input: [F; 8] = F::new_array([0, 1, 2, 3, 4, 5, 6, 7]);
+
+            let mut expected = input;
+            perm.permute_mut(&mut expected);
+
+            let mut avx2_input = input.map(Into::<PackedGoldilocksAVX2>::into);
+            perm.permute_mut(&mut avx2_input);
+
+            let avx2_output = avx2_input.map(|x| x.0[0]);
+            assert_eq!(avx2_output, expected);
+        }
+
+        #[test]
+        fn test_avx2_poseidon_width_12() {
+            let perm = default_goldilocks_poseidon1_12();
+            let input: [F; 12] = F::new_array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+
+            let mut expected = input;
+            perm.permute_mut(&mut expected);
+
+            let mut avx2_input = input.map(Into::<PackedGoldilocksAVX2>::into);
+            perm.permute_mut(&mut avx2_input);
 
             let avx2_output = avx2_input.map(|x| x.0[0]);
             assert_eq!(avx2_output, expected);
