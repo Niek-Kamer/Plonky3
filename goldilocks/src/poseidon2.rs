@@ -1052,6 +1052,8 @@ impl GenericPoseidon2LinearLayers<20> for GenericPoseidon2LinearLayersGoldilocks
 mod tests {
     use p3_field::PrimeCharacteristicRing;
     use p3_symmetric::Permutation;
+    use rand::SeedableRng;
+    use rand::rngs::SmallRng;
 
     use super::*;
 
@@ -1251,5 +1253,306 @@ mod tests {
         perm.permute_mut(&mut input);
 
         assert_eq!(input, expected);
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+    mod avx512 {
+        use super::*;
+        use crate::PackedGoldilocksAVX512;
+
+        const LANES: usize = 8;
+        const ITERS: usize = 16;
+
+        #[test]
+        fn test_avx512_poseidon2_per_lane_width_8() {
+            const W: usize = 8;
+            let mut rng = SmallRng::seed_from_u64(0xCAFE_0008);
+            let perm = Poseidon2Goldilocks::<W>::new_from_rng_128(&mut rng);
+
+            for _ in 0..ITERS {
+                let scalar_inputs: [[F; W]; LANES] =
+                    core::array::from_fn(|_| rand::RngExt::random(&mut rng));
+
+                let mut scalar_outputs = scalar_inputs;
+                for lane in &mut scalar_outputs {
+                    perm.permute_mut(lane);
+                }
+
+                let mut packed: [PackedGoldilocksAVX512; W] = core::array::from_fn(|i| {
+                    PackedGoldilocksAVX512(core::array::from_fn(|k| scalar_inputs[k][i]))
+                });
+                perm.permute_mut(&mut packed);
+
+                for (k, expected_lane) in scalar_outputs.iter().enumerate() {
+                    let lane_output: [F; W] = packed.map(|x| x.0[k]);
+                    assert_eq!(
+                        lane_output, *expected_lane,
+                        "lane {k} diverged from scalar oracle",
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn test_avx512_poseidon2_per_lane_width_12() {
+            const W: usize = 12;
+            let mut rng = SmallRng::seed_from_u64(0xCAFE_0012);
+            let perm = Poseidon2Goldilocks::<W>::new_from_rng_128(&mut rng);
+
+            for _ in 0..ITERS {
+                let scalar_inputs: [[F; W]; LANES] =
+                    core::array::from_fn(|_| rand::RngExt::random(&mut rng));
+
+                let mut scalar_outputs = scalar_inputs;
+                for lane in &mut scalar_outputs {
+                    perm.permute_mut(lane);
+                }
+
+                let mut packed: [PackedGoldilocksAVX512; W] = core::array::from_fn(|i| {
+                    PackedGoldilocksAVX512(core::array::from_fn(|k| scalar_inputs[k][i]))
+                });
+                perm.permute_mut(&mut packed);
+
+                for (k, expected_lane) in scalar_outputs.iter().enumerate() {
+                    let lane_output: [F; W] = packed.map(|x| x.0[k]);
+                    assert_eq!(
+                        lane_output, *expected_lane,
+                        "lane {k} diverged from scalar oracle",
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn test_avx512_poseidon2_per_lane_width_16() {
+            const W: usize = 16;
+            let mut rng = SmallRng::seed_from_u64(0xCAFE_0016);
+            let perm = Poseidon2Goldilocks::<W>::new_from_rng_128(&mut rng);
+
+            for _ in 0..ITERS {
+                let scalar_inputs: [[F; W]; LANES] =
+                    core::array::from_fn(|_| rand::RngExt::random(&mut rng));
+
+                let mut scalar_outputs = scalar_inputs;
+                for lane in &mut scalar_outputs {
+                    perm.permute_mut(lane);
+                }
+
+                let mut packed: [PackedGoldilocksAVX512; W] = core::array::from_fn(|i| {
+                    PackedGoldilocksAVX512(core::array::from_fn(|k| scalar_inputs[k][i]))
+                });
+                perm.permute_mut(&mut packed);
+
+                for (k, expected_lane) in scalar_outputs.iter().enumerate() {
+                    let lane_output: [F; W] = packed.map(|x| x.0[k]);
+                    assert_eq!(
+                        lane_output, *expected_lane,
+                        "lane {k} diverged from scalar oracle",
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx2",
+        not(target_feature = "avx512f")
+    ))]
+    mod avx2 {
+        use super::*;
+        use crate::PackedGoldilocksAVX2;
+
+        const LANES: usize = 4;
+        const ITERS: usize = 16;
+
+        #[test]
+        fn test_avx2_poseidon2_per_lane_width_8() {
+            const W: usize = 8;
+            let mut rng = SmallRng::seed_from_u64(0xDEAD_0008);
+            let perm = Poseidon2Goldilocks::<W>::new_from_rng_128(&mut rng);
+
+            for _ in 0..ITERS {
+                let scalar_inputs: [[F; W]; LANES] =
+                    core::array::from_fn(|_| rand::RngExt::random(&mut rng));
+
+                let mut scalar_outputs = scalar_inputs;
+                for lane in &mut scalar_outputs {
+                    perm.permute_mut(lane);
+                }
+
+                let mut packed: [PackedGoldilocksAVX2; W] = core::array::from_fn(|i| {
+                    PackedGoldilocksAVX2(core::array::from_fn(|k| scalar_inputs[k][i]))
+                });
+                perm.permute_mut(&mut packed);
+
+                for (k, expected_lane) in scalar_outputs.iter().enumerate() {
+                    let lane_output: [F; W] = packed.map(|x| x.0[k]);
+                    assert_eq!(
+                        lane_output, *expected_lane,
+                        "lane {k} diverged from scalar oracle",
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn test_avx2_poseidon2_per_lane_width_12() {
+            const W: usize = 12;
+            let mut rng = SmallRng::seed_from_u64(0xDEAD_0012);
+            let perm = Poseidon2Goldilocks::<W>::new_from_rng_128(&mut rng);
+
+            for _ in 0..ITERS {
+                let scalar_inputs: [[F; W]; LANES] =
+                    core::array::from_fn(|_| rand::RngExt::random(&mut rng));
+
+                let mut scalar_outputs = scalar_inputs;
+                for lane in &mut scalar_outputs {
+                    perm.permute_mut(lane);
+                }
+
+                let mut packed: [PackedGoldilocksAVX2; W] = core::array::from_fn(|i| {
+                    PackedGoldilocksAVX2(core::array::from_fn(|k| scalar_inputs[k][i]))
+                });
+                perm.permute_mut(&mut packed);
+
+                for (k, expected_lane) in scalar_outputs.iter().enumerate() {
+                    let lane_output: [F; W] = packed.map(|x| x.0[k]);
+                    assert_eq!(
+                        lane_output, *expected_lane,
+                        "lane {k} diverged from scalar oracle",
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn test_avx2_poseidon2_per_lane_width_16() {
+            const W: usize = 16;
+            let mut rng = SmallRng::seed_from_u64(0xDEAD_0016);
+            let perm = Poseidon2Goldilocks::<W>::new_from_rng_128(&mut rng);
+
+            for _ in 0..ITERS {
+                let scalar_inputs: [[F; W]; LANES] =
+                    core::array::from_fn(|_| rand::RngExt::random(&mut rng));
+
+                let mut scalar_outputs = scalar_inputs;
+                for lane in &mut scalar_outputs {
+                    perm.permute_mut(lane);
+                }
+
+                let mut packed: [PackedGoldilocksAVX2; W] = core::array::from_fn(|i| {
+                    PackedGoldilocksAVX2(core::array::from_fn(|k| scalar_inputs[k][i]))
+                });
+                perm.permute_mut(&mut packed);
+
+                for (k, expected_lane) in scalar_outputs.iter().enumerate() {
+                    let lane_output: [F; W] = packed.map(|x| x.0[k]);
+                    assert_eq!(
+                        lane_output, *expected_lane,
+                        "lane {k} diverged from scalar oracle",
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    mod neon {
+        use super::*;
+        use crate::PackedGoldilocksNeon;
+
+        const LANES: usize = 2;
+        const ITERS: usize = 16;
+
+        #[test]
+        fn test_neon_poseidon2_per_lane_width_8() {
+            const W: usize = 8;
+            let mut rng = SmallRng::seed_from_u64(0xBEEF_0008);
+            let perm = Poseidon2Goldilocks::<W>::new_from_rng_128(&mut rng);
+
+            for _ in 0..ITERS {
+                let scalar_inputs: [[F; W]; LANES] =
+                    core::array::from_fn(|_| rand::RngExt::random(&mut rng));
+
+                let mut scalar_outputs = scalar_inputs;
+                for lane in &mut scalar_outputs {
+                    perm.permute_mut(lane);
+                }
+
+                let mut packed: [PackedGoldilocksNeon; W] = core::array::from_fn(|i| {
+                    PackedGoldilocksNeon(core::array::from_fn(|k| scalar_inputs[k][i]))
+                });
+                perm.permute_mut(&mut packed);
+
+                for (k, expected_lane) in scalar_outputs.iter().enumerate() {
+                    let lane_output: [F; W] = packed.map(|x| x.0[k]);
+                    assert_eq!(
+                        lane_output, *expected_lane,
+                        "lane {k} diverged from scalar oracle",
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn test_neon_poseidon2_per_lane_width_12() {
+            const W: usize = 12;
+            let mut rng = SmallRng::seed_from_u64(0xBEEF_0012);
+            let perm = Poseidon2Goldilocks::<W>::new_from_rng_128(&mut rng);
+
+            for _ in 0..ITERS {
+                let scalar_inputs: [[F; W]; LANES] =
+                    core::array::from_fn(|_| rand::RngExt::random(&mut rng));
+
+                let mut scalar_outputs = scalar_inputs;
+                for lane in &mut scalar_outputs {
+                    perm.permute_mut(lane);
+                }
+
+                let mut packed: [PackedGoldilocksNeon; W] = core::array::from_fn(|i| {
+                    PackedGoldilocksNeon(core::array::from_fn(|k| scalar_inputs[k][i]))
+                });
+                perm.permute_mut(&mut packed);
+
+                for (k, expected_lane) in scalar_outputs.iter().enumerate() {
+                    let lane_output: [F; W] = packed.map(|x| x.0[k]);
+                    assert_eq!(
+                        lane_output, *expected_lane,
+                        "lane {k} diverged from scalar oracle",
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn test_neon_poseidon2_per_lane_width_16() {
+            const W: usize = 16;
+            let mut rng = SmallRng::seed_from_u64(0xBEEF_0016);
+            let perm = Poseidon2Goldilocks::<W>::new_from_rng_128(&mut rng);
+
+            for _ in 0..ITERS {
+                let scalar_inputs: [[F; W]; LANES] =
+                    core::array::from_fn(|_| rand::RngExt::random(&mut rng));
+
+                let mut scalar_outputs = scalar_inputs;
+                for lane in &mut scalar_outputs {
+                    perm.permute_mut(lane);
+                }
+
+                let mut packed: [PackedGoldilocksNeon; W] = core::array::from_fn(|i| {
+                    PackedGoldilocksNeon(core::array::from_fn(|k| scalar_inputs[k][i]))
+                });
+                perm.permute_mut(&mut packed);
+
+                for (k, expected_lane) in scalar_outputs.iter().enumerate() {
+                    let lane_output: [F; W] = packed.map(|x| x.0[k]);
+                    assert_eq!(
+                        lane_output, *expected_lane,
+                        "lane {k} diverged from scalar oracle",
+                    );
+                }
+            }
+        }
     }
 }
