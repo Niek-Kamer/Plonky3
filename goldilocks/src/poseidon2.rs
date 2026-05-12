@@ -1052,7 +1052,9 @@ impl GenericPoseidon2LinearLayers<20> for GenericPoseidon2LinearLayersGoldilocks
 mod tests {
     use p3_field::PrimeCharacteristicRing;
     use p3_symmetric::Permutation;
+    #[allow(unused_imports)]
     use rand::SeedableRng;
+    #[allow(unused_imports)]
     use rand::rngs::SmallRng;
 
     use super::*;
