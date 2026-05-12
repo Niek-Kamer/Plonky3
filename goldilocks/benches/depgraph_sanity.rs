@@ -36,10 +36,10 @@ fn sbox<T: PrimeCharacteristicRing + Copy>(x: T, rc: T) -> T {
 fn mix<T: PrimeCharacteristicRing + Copy>(state: &mut [T; WIDTH]) {
     let mut sum = state[0];
     for s in &state[1..] {
-        sum = sum + *s;
+        sum += *s;
     }
     for s in state.iter_mut() {
-        *s = *s + sum;
+        *s += sum;
     }
 }
 
@@ -66,14 +66,14 @@ fn synthetic_perm<T: PrimeCharacteristicRing + Copy>(
     rc_internal: &[T; ROUNDS_P],
     rc_external_term: &[[T; WIDTH]; ROUNDS_F_HALF],
 ) {
-    for round in 0..ROUNDS_F_HALF {
-        external_round(state, &rc_external_init[round]);
+    for rc in rc_external_init {
+        external_round(state, rc);
     }
-    for round in 0..ROUNDS_P {
-        internal_round(state, rc_internal[round]);
+    for &rc in rc_internal {
+        internal_round(state, rc);
     }
-    for round in 0..ROUNDS_F_HALF {
-        external_round(state, &rc_external_term[round]);
+    for rc in rc_external_term {
+        external_round(state, rc);
     }
 }
 
@@ -83,11 +83,9 @@ where
     StandardUniform: Distribution<T>,
 {
     let mut rng = SmallRng::seed_from_u64(1);
-    let rc_init: [[T; WIDTH]; ROUNDS_F_HALF] =
-        array::from_fn(|_| array::from_fn(|_| rng.random()));
+    let rc_init: [[T; WIDTH]; ROUNDS_F_HALF] = array::from_fn(|_| array::from_fn(|_| rng.random()));
     let rc_internal: [T; ROUNDS_P] = array::from_fn(|_| rng.random());
-    let rc_term: [[T; WIDTH]; ROUNDS_F_HALF] =
-        array::from_fn(|_| array::from_fn(|_| rng.random()));
+    let rc_term: [[T; WIDTH]; ROUNDS_F_HALF] = array::from_fn(|_| array::from_fn(|_| rng.random()));
 
     c.bench_function(name, |b| {
         b.iter_batched(
