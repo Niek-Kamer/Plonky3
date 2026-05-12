@@ -43,5 +43,13 @@ harness = false
 name = "poseidon"
 harness = false
 
+[[bench]]
+name = "packing_sanity"
+harness = false
+
+[[bench]]
+name = "depgraph_sanity"
+harness = false
+
 [lints]
 workspace = true
